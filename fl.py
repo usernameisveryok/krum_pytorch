@@ -40,7 +40,10 @@ class ConvNet(nn.Module):
 def pars_args():
     parser = argparse.ArgumentParser(description="Train AWF")
     parser.add_argument("--expname", type=str, required=True)
+    parser.add_argument("--lableflip", action="store_true")
+    parser.add_argument("--bitfail", action="store_true")
     args = parser.parse_args()
+    
     return args
 def all_reduce_gradients(model,world_size):
     for param in model.parameters():
@@ -58,17 +61,36 @@ def all_reduce_gradientsv2(model, world_size):
             grads[0]+=grads[i]
         grads[0]/=float(world_size)
         param.grad.data.copy_(grads[0])
+def bit_fail_grad(model, world_size,faillist):
+    
+    for param in model.parameters():
+        grads = []
+        for i in range(world_size):
+            grads.append(param.grad.data.clone())  
+        for i in range(world_size):
+            dist.broadcast(grads[i],i)
+        #do bitfailure
+        grads[faillist[0]] = -grads[faillist[0]]
+        for i in range(1,len(faillist)):
+            grads[faillist[i]] = grads[faillist[0]]
+        for i in range(1,world_size):                
+            grads[0]+=grads[i]
+        grads[0]/=float(world_size)
+        param.grad.data.copy_(grads[0])
 transform = transforms.Compose(
         [transforms.RandomHorizontalFlip(),
          transforms.RandomCrop(32, padding=4),
          transforms.ToTensor(),
          transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+def label_flipping(lables,rank,ranks,world_size):
+    if rank in ranks:
+        lables = world_size - lables -1
 def main_worker(rank, world_size):
     
     args = pars_args()
     logging.basicConfig(level=logging.INFO,filename=f"./log/node{rank}.log", format=f'NODE {rank} - %(asctime)s -  %(message)s')
     logger = logging.getLogger(__name__)
-    writer = SummaryWriter(f'./{args.expname}/log/node{rank}')
+    writer = SummaryWriter(f'./runs/{args.expname}/node{rank}')
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12345'
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
@@ -105,16 +127,19 @@ def main_worker(rank, world_size):
         for i, data in enumerate(trainloader, 0):
             inputs, labels = data
             inputs, labels = inputs.cuda(), labels.cuda()
-            #DO Label-flipping Failure
-            if rank in[5,7]:
-                labels = 9 - labels
+            if args.lableflip:
+                label_flipping(labels,rank,[],world_size)
             optimizer.zero_grad()
             # print(inputs.shape)
             outputs = model(inputs)
             # print(outputs.shape)
             loss = criterion(outputs, labels)
             loss.backward()
-            all_reduce_gradientsv2(model ,world_size)
+            
+            if args.bitfail:
+                bit_fail_grad(model ,world_size,[1,2,3])
+            else:
+                all_reduce_gradientsv2(model ,world_size)
             optimizer.step()
             running_loss += loss.item()
             pred= torch.argmax(outputs,1)
